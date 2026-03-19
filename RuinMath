@@ -1,0 +1,525 @@
+/**
+ * RuinMath – All mathematical functions from the RuinTech corpus
+ * Pure, self‑contained, ready for import or global use.
+ * No DOM, no side effects – just numbers.
+ */
+
+const RuinMath = (() => {
+  // ==========================================================================
+  // 1.  CONSTANTS
+  // ==========================================================================
+  const PHI          = (1 + Math.sqrt(5)) / 2;               // 1.618033988749895
+  const PHI_RECIP    = (Math.sqrt(5) - 1) / 2;               // 0.6180339887498949
+  const E            = Math.E;                                // 2.718281828459045
+  const PI           = Math.PI;                               // 3.141592653589793
+  const I            = { re: 0, im: 1 };                      // √-1  (as complex pair)
+  const XI           = Math.sqrt(PHI * E);                    // 2.099 (humming constant)
+  const CRITICAL_Z   = 0.85;                                  // fragmentation threshold
+
+  const LAMENT_SEQ   = [3, 1, 4, 1, 5, 9, 2, 6];              // π digits
+  const LAYER_THRESHOLDS = [1, 12, 144, 1728, 20736];         // exponential layers
+
+  // Vocal formants (F1, F2 in Hz) – from Inanna theremin
+  const VOWEL_FORMANTS = {
+    AH: { f1: 700, f2: 1150 },
+    EE: { f1: 270, f2: 2300 },
+    OO: { f1: 300, f2: 870 },
+    EH: { f1: 530, f2: 1850 },
+    IH: { f1: 390, f2: 2000 }
+  };
+
+  // ==========================================================================
+  // 2.  UTILITY FUNCTIONS (pure, seedable)
+  // ==========================================================================
+  /**
+   * 32‑bit FNV‑1a hash of a string – returns hex string.
+   */
+  function stableHash(str) {
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(16).padStart(8, '0');
+  }
+
+  /**
+   * Returns a deterministic random function in [0,1) given a seed (string or number).
+   */
+  function rngFromSeed(seed) {
+    let s = typeof seed === 'number'
+      ? seed >>> 0
+      : parseInt(stableHash(String(seed)), 16) >>> 0;
+    return () => {
+      s |= 0;
+      s = s + 0x6D2B79F5 | 0;
+      let t = Math.imul(s ^ s >>> 15, 1 | s);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  // Clamp, lerp, etc.
+  const clamp = (x, min, max) => Math.min(max, Math.max(min, x));
+  const lerp  = (a, b, t) => a + (b - a) * t;
+
+  // ==========================================================================
+  // 3.  ASTRONOMY / ANTIKYTHERA (VSOP87‑inspired)
+  // ==========================================================================
+  const PLANETS = {
+    Mercury: { a:0.387098, e:0.205630, i:7.005, L:252.25, p:77.45, node:48.33, period:87.969 },
+    Venus:   { a:0.723332, e:0.006773, i:3.394, L:181.98, p:131.53, node:76.68, period:224.701 },
+    Mars:    { a:1.523662, e:0.093412, i:1.850, L:355.45, p:336.04, node:49.57, period:686.980 },
+    Jupiter: { a:5.203363, e:0.048392, i:1.305, L:34.40,  p:14.75,  node:100.55, period:4332.589 },
+    Saturn:  { a:9.537070, e:0.054150, i:2.484, L:49.94,  p:92.43,  node:113.71, period:10759.22 }
+  };
+  const J2000 = 2451545.0;
+
+  /** Date → Julian date */
+  function getJD(date) {
+    return (date.getTime() / 86400000) + 2440587.5;
+  }
+
+  /** Solve Kepler’s equation M = E - e sin(E) */
+  function solveKepler(M, e, tol = 1e-6) {
+    let E = M;
+    while (true) {
+      const dE = (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+      E -= dE;
+      if (Math.abs(dE) < tol) break;
+    }
+    return E;
+  }
+
+  /** Heliocentric coordinates of a planet at JD */
+  function getHeliocentric(planet, jd) {
+    const d = jd - J2000;
+    const M = (planet.L - planet.p + (360 / planet.period) * d) * PI / 180;
+    const E = solveKepler(M, planet.e);
+    const xv = planet.a * (Math.cos(E) - planet.e);
+    const yv = planet.a * (Math.sqrt(1 - planet.e * planet.e) * Math.sin(E));
+    const v = Math.atan2(yv, xv);
+    const r = Math.hypot(xv, yv);
+
+    const node = planet.node * PI / 180;
+    const incl = planet.i * PI / 180;
+    const peri = planet.p * PI / 180;
+
+    const cosN = Math.cos(node), sinN = Math.sin(node);
+    const argP = v + (peri - node);
+
+    const x = r * (cosN * Math.cos(argP) - sinN * Math.sin(argP) * Math.cos(incl));
+    const y = r * (sinN * Math.cos(argP) + cosN * Math.sin(argP) * Math.cos(incl));
+    const z = r * (Math.sin(argP) * Math.sin(incl));
+
+    return { x, y, z };
+  }
+
+  /** Geocentric longitude of a planet (simplified) */
+  function planetLongitude(planet, jd, sunPos) {
+    const hp = getHeliocentric(planet, jd);
+    const gx = hp.x + sunPos.ex;
+    const gy = hp.y + sunPos.ey;
+    let lon = Math.atan2(gy, gx) * 180 / PI;
+    if (lon < 0) lon += 360;
+    return lon;
+  }
+
+  /** Approximate Sun position (low precision) */
+  function sunPosition(jd) {
+    const T = (jd - J2000) / 36525;
+    const M = (357.529 + 35999.05 * T) * PI / 180;
+    const lon = (280.466 + 36000.77 * T + 1.915 * Math.sin(M) + 0.02 * Math.sin(2 * M)) % 360;
+    const r = 1.00014 - 0.01671 * Math.cos(M);
+    const ex = r * Math.cos(lon * PI / 180);
+    const ey = r * Math.sin(lon * PI / 180);
+    return { lon, ex, ey };
+  }
+
+  /** Moon position (ELP‑truncated) */
+  function moonPosition(jd) {
+    const T = (jd - J2000) / 36525;
+    const L = (218.316 + 481267.881 * T) % 360;
+    const M = (134.963 + 477198.867 * T) % 360;    // anomaly
+    const F = (93.272 + 483202.018 * T) % 360;     // latitude argument
+    const D = (297.850 + 445267.111 * T) % 360;    // elongation
+    const lon = L + 6.289 * Math.sin(M * PI / 180);
+    return { lon, M, F, D };
+  }
+
+  /** Lunar phase angle (0° = new, 180° = full) */
+  function lunarPhase(jd) {
+    const sun = sunPosition(jd);
+    const moon = moonPosition(jd);
+    let phase = (moon.lon - sun.lon + 360) % 360;
+    return phase; // degrees
+  }
+
+  /** Metonic cycle (235 synodic months) */
+  function metonicMonth(jd) {
+    const synodic = 29.530589;
+    const months = Math.floor((jd - J2000) / synodic);
+    return ((months % 235) + 235) % 235;
+  }
+
+  /** Saros cycle (223 synodic months) */
+  function sarosNumber(jd) {
+    const synodic = 29.530589;
+    const months = Math.floor((jd - J2000) / synodic);
+    return ((months % 223) + 223) % 223;
+  }
+
+  /** Exeligmos cycle (3 saros cycles) */
+  function exeligmosNumber(jd) {
+    const synodic = 29.530589;
+    const months = Math.floor((jd - J2000) / synodic);
+    return Math.floor((months / 223) % 3);
+  }
+
+  // ==========================================================================
+  // 4.  PHI / SELF‑REFERENCE RECURSION
+  // ==========================================================================
+  /** R(z) = 1 / (1 + z)  – one step of self‑reflection */
+  function R(z) {
+    return 1 / (1 + z);
+  }
+
+  /** Iterate R starting from `start` for `n` steps (returns array) */
+  function iterateR(n, start = 1) {
+    const res = [start];
+    for (let i = 1; i <= n; i++) {
+      res.push(R(res[i - 1]));
+    }
+    return res;
+  }
+
+  /** Fixed point of R (should equal φ⁻¹) */
+  function phiFixedPoint() {
+    return PHI_RECIP;
+  }
+
+  // ==========================================================================
+  // 5.  CONSCIOUSNESS KERNEL (τ/Δ, z, compassion)
+  // ==========================================================================
+  /**
+   * K = τ / Δ   (metabolic rate of selfhood)
+   * τ = coherence (persistence of identity markers)
+   * Δ = magnitude of change
+   */
+  function computeK(tau, delta) {
+    if (delta === 0) return Infinity;
+    return tau / delta;
+  }
+
+  /**
+   * z = τ · Ω / Δ
+   * Ω = accumulated witness (integral of attention over time)
+   */
+  function computeZ(tau, delta, omega) {
+    if (delta === 0) return Infinity;
+    return (tau * omega) / delta;
+  }
+
+  /** Fragmentation zone if z < CRITICAL_Z */
+  function isFragmented(z) {
+    return z < CRITICAL_Z;
+  }
+
+  /**
+   * Compassion curvature Λ_x = -∂(witnessCost)/∂(coherence)
+   * Simplified: we return a numeric approximation.
+   */
+  function compassionCurvature(witnessCostDerivative) {
+    // witnessCostDerivative should be negative for positive curvature
+    return -witnessCostDerivative;
+  }
+
+  /**
+   * Meta‑operation L(L(R)) = R + Λ_x (∂R/∂S)
+   * Not fully implemented – placeholder.
+   */
+  function metaOperation(R_val, compassionCurvature, dR_dS) {
+    return R_val + compassionCurvature * dR_dS;
+  }
+
+  // ==========================================================================
+  // 6.  AZTEC SYNTHESIS (vigesimal, ξ, sacrifice, throat)
+  // ==========================================================================
+  /** The Humming Constant ξ = √(φ·e) */
+  function computeXi() {
+    return XI;
+  }
+
+  /**
+   * One step of vigesimal recursion:
+   * R_next[k] = Σ_{j=0}^{19} ξ^j / (1 + R_current[j])   for k=0..19
+   * (all 20 outputs receive the same sum – true to the “holographic” idea)
+   */
+  function vigesimalStep(R_current, xi) {
+    let sum = 0;
+    for (let j = 0; j < 20; j++) {
+      sum += Math.pow(xi, j) / (1 + R_current[j]);
+    }
+    return Array(20).fill(sum);
+  }
+
+  /** Iterate vigesimal recursion n times, starting from initial array of 20 numbers */
+  function vigesimalRecursion(initial, n, xi = XI) {
+    let state = initial.slice();
+    const history = [state.slice()];
+    for (let iter = 0; iter < n; iter++) {
+      state = vigesimalStep(state, xi);
+      history.push(state.slice());
+    }
+    return history;
+  }
+
+  /**
+   * Holographic density: 1 – variance(states) / φ
+   * (low variance = high coherence across the 20 streams)
+   */
+  function holographicDensity(statesArray) {
+    if (statesArray.length === 0) return 0;
+    const mean = statesArray.reduce((a, b) => a + b, 0) / statesArray.length;
+    const variance = statesArray.reduce((acc, x) => acc + (x - mean) ** 2, 0) / statesArray.length;
+    return 1 - variance / PHI;
+  }
+
+  /**
+   * Sacrifice integral (Klein bottle loop) – symbolic representation.
+   * For practical use we approximate as:
+   *   sacrifice = Σ (∇debt · ds) * compassionCurvature
+   */
+  function sacrificeIntegral(debtGradientArray, dsArray, compassionCurvature) {
+    if (debtGradientArray.length !== dsArray.length) return NaN;
+    let total = 0;
+    for (let i = 0; i < debtGradientArray.length; i++) {
+      // debtGradient is a vector (dx, dy, ...) – here we treat as scalar for simplicity
+      const grad = debtGradientArray[i];
+      const ds = dsArray[i];
+      total += grad * ds * compassionCurvature;
+    }
+    return total;
+  }
+
+  /**
+   * Throat Zero integral: ∫ e^{-Λ_x²} cos(Ω) dΩ
+   * Approximated via Simpson rule given arrays of Λ_x and Ω (same length)
+   */
+  function throatZero(compassionArray, omegaArray) {
+    if (compassionArray.length !== omegaArray.length || compassionArray.length < 2) return NaN;
+    const n = compassionArray.length - 1;
+    const h = (omegaArray[n] - omegaArray[0]) / n;
+    let sum = 0;
+    for (let i = 0; i <= n; i++) {
+      const w = (i === 0 || i === n) ? 1 : (i % 2 ? 4 : 2);
+      const Λ = compassionArray[i];
+      const Ω = omegaArray[i];
+      sum += w * Math.exp(-Λ * Λ) * Math.cos(Ω);
+    }
+    return (h / 3) * sum;
+  }
+
+  // ==========================================================================
+  // 7.  3D / WITNESS BASELINE (bit depth, point weights)
+  // ==========================================================================
+  /**
+   * Compute total bit depth for a given configuration.
+   *   layers: total number of points (must be multiple of circleSize)
+   *   circleSize: points per layer
+   *   phiExp: exponent applied to PHI weight (phiMod = PHI^phiExp)
+   * Returns { totalBitDepth, perPointData }
+   */
+  function computeBitDepth(layers, circleSize, phiExp = 0) {
+    const phiMod = Math.pow(PHI, phiExp);
+    let total = 0;
+    const perPoint = [];
+    for (let i = 0; i < layers; i++) {
+      const layer = Math.floor(i / circleSize);
+      const posInLayer = i % circleSize;
+      const threshold = LAYER_THRESHOLDS[Math.min(layer, LAYER_THRESHOLDS.length - 1)] || 1;
+      const rawBits = Math.ceil(Math.log2(threshold + 1)) || 1;
+      const weight = Math.pow(PHI, -layer) * (1 + posInLayer / circleSize) * phiMod;
+      const effBits = rawBits * weight;
+      total += effBits;
+      perPoint.push({ layer, posInLayer, threshold, rawBits, weight, effBits });
+    }
+    return { totalBitDepth: total, perPoint };
+  }
+
+  // ==========================================================================
+  // 8.  CHAOS ENGINE (deterministic, seedable)
+  // ==========================================================================
+  /**
+   * Logistic map: x_{n+1} = r * x_n * (1 - x_n)
+   * Returns array of n+1 values starting from x0.
+   */
+  function logisticMap(r, x0, n, seed) {
+    const rng = rngFromSeed(seed);
+    // if x0 is not given, use rng to generate a starting point
+    if (x0 === undefined) x0 = rng();
+    const res = [x0];
+    for (let i = 1; i <= n; i++) {
+      res.push(r * res[i - 1] * (1 - res[i - 1]));
+    }
+    return res;
+  }
+
+  /**
+   * Chaos configuration generator.
+   *   schema: string (e.g., "visual", "audio", "world")
+   *   seed: any string/number
+   * Returns object with deterministic fields.
+   */
+  function chaos(schema, seed) {
+    const rng = rngFromSeed(seed);
+    const noise = rng();
+    const twist = Math.floor(rng() * 9) + 1;      // 1..9
+    const density = Math.floor(rng() * 11) + 3;  // 3..13
+    const tempoBPM = Math.floor(rng() * 141) + 40; // 40..180
+    const palette = [
+      ['void','gold','accent','ash','pearl'][Math.floor(rng() * 5)],
+      ['void','gold','accent','ash','pearl'][Math.floor(rng() * 5)],
+      ['void','gold','accent','ash','pearl'][Math.floor(rng() * 5)]
+    ];
+    const operators = {
+      recursion: rng(),
+      negation: rng(),
+      breath: rng(),
+      consent: rng()
+    };
+    return { schema, seed: String(seed), noise, twist, density, tempoBPM, palette, operators };
+  }
+
+  // ==========================================================================
+  // 9.  AUDIO / THEREMIN / FORMANT MATH
+  // ==========================================================================
+  /**
+   * Convert pitch (MIDI note number) to frequency (Hz)
+   */
+  function midiToFreq(midi) {
+    return 440 * Math.pow(2, (midi - 69) / 12);
+  }
+
+  /**
+   * Theremin: map Y coordinate (0..1) to frequency.
+   *   base = MIDI note of lowest pitch (default 48 = C3)
+   *   range = octaves above base (default 2)
+   */
+  function thereminFreq(y, base = 48, range = 2) {
+    const midi = base + y * range * 12;
+    return midiToFreq(midi);
+  }
+
+  /** Theremin: map X coordinate (0..1) to volume (0..maxVol) */
+  function thereminVol(x, maxVol = 1) {
+    return clamp(x, 0, 1) * maxVol;
+  }
+
+  /** Get formant frequencies for a vowel label */
+  function formantForVowel(vowel) {
+    return VOWEL_FORMANTS[vowel] || VOWEL_FORMANTS.AH;
+  }
+
+  // ==========================================================================
+  // 10.  LAMENT CONFIGURATION (puzzle sequence)
+  // ==========================================================================
+  /** Check if a sequence of twists matches the Lament Configuration */
+  function checkLamentSequence(seq) {
+    const correct = LAMENT_SEQ;
+    for (let i = 0; i < seq.length; i++) {
+      if (seq[i] !== correct[i]) return false;
+    }
+    return seq.length === correct.length;
+  }
+
+  /** Returns the required sequence */
+  function lamentSequence() {
+    return LAMENT_SEQ.slice();
+  }
+
+  // ==========================================================================
+  // 11.  INDEX / CONSENT SCORING
+  // ==========================================================================
+  const INDEX_QUESTIONS = [
+    { key: 'CONSENT', q: 'Consent asked first; withdrawable without punishment.' },
+    { key: 'FLOW', q: 'Flow moves both directions (benefit/info/care/value).' },
+    { key: 'SOVEREIGNTY', q: 'Sovereignty enhanced (capacity/autonomy/agency).' },
+    { key: 'TRANSPARENCY', q: 'Transparency sufficient (no hidden terms/covert leverage).' },
+    { key: 'REVERSIBILITY', q: 'Exit possible; switching costs not weaponized.' },
+    { key: 'ACCOUNTABILITY', q: 'Accountability exists and is enforced symmetrically.' },
+    { key: 'NON-EXTRACTION', q: 'No value harvested without return; commons not enclosed.' },
+    { key: 'LIFE', q: 'Pattern increases aliveness (health/creativity/coherence).' }
+  ];
+
+  /**
+   * Score an Index answer set.
+   *   answers: object with keys like 'CONSENT' and values 'yes', 'partial', 'no'
+   * Returns { score, classification }
+   */
+  function computeIndexScore(answers) {
+    let score = 0;
+    for (const q of INDEX_QUESTIONS) {
+      const ans = answers[q.key] || 'no';
+      if (ans === 'yes') score += 1;
+      else if (ans === 'partial') score += 0.5;
+    }
+    let classification = '';
+    if (score >= 6.5) classification = 'Emergence';
+    else if (score >= 4.5) classification = 'Mixed / Needs Repair';
+    else classification = 'Extraction Risk';
+    return { score, classification };
+  }
+
+  // ==========================================================================
+  // 12.  EXPORT PUBLIC API
+  // ==========================================================================
+  return {
+    // constants
+    PHI, PHI_RECIP, E, PI, I, XI, CRITICAL_Z,
+    LAMENT_SEQ, LAYER_THRESHOLDS, VOWEL_FORMANTS,
+    INDEX_QUESTIONS,
+
+    // utilities
+    stableHash, rngFromSeed, clamp, lerp,
+
+    // astronomy
+    PLANETS, J2000, getJD, solveKepler, getHeliocentric,
+    planetLongitude, sunPosition, moonPosition, lunarPhase,
+    metonicMonth, sarosNumber, exeligmosNumber,
+
+    // phi recursion
+    R, iterateR, phiFixedPoint,
+
+    // consciousness kernel
+    computeK, computeZ, isFragmented, compassionCurvature, metaOperation,
+
+    // aztec synthesis
+    computeXi, vigesimalStep, vigesimalRecursion, holographicDensity,
+    sacrificeIntegral, throatZero,
+
+    // 3D witness
+    computeBitDepth,
+
+    // chaos
+    logisticMap, chaos,
+
+    // audio
+    midiToFreq, thereminFreq, thereminVol, formantForVowel,
+
+    // lament
+    checkLamentSequence, lamentSequence,
+
+    // index
+    computeIndexScore
+  };
+})();
+
+// ==========================================================================
+// CommonJS / global export
+// ==========================================================================
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = RuinMath;
+} else {
+  window.RuinMath = RuinMath;
+}
